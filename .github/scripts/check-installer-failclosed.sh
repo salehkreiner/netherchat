@@ -194,3 +194,8 @@ if [ "$fails" -ne 0 ]; then
     exit 1
 fi
 echo "installer fail-closed: all checks passed"
+# EXIT EXPLICITLY, for the reason the .ps1 sibling does. A script's status is its
+# last command's, and most cases here run the installer expecting a REFUSAL. This
+# one happens to end on a case that expects an install, so it exits 0 by luck;
+# reorder the cases and a green run reports failure. set -e does not cover this.
+exit 0

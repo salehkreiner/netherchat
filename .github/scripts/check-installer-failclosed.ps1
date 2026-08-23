@@ -218,3 +218,12 @@ if ($fails -ne 0) {
     exit 1
 }
 Write-Host "installer fail-closed (ps1): all checks passed"
+# EXIT EXPLICITLY. Most cases here run install.ps1 expecting it to REFUSE, so the
+# last external process this script runs exits 1 on purpose. Without this line the
+# script's own status is whatever that was: GitHub invokes it as
+# `powershell -command ". '{0}'"`, which carries $LASTEXITCODE out as the step's
+# verdict, so a run in which every check passed reported failure. It passed when
+# run by hand, where nothing reads the status. Same shape as osslsigncode verify
+# returning 0 on an untimestamped signature -- an exit code that does not mean
+# what the caller assumes.
+exit 0
