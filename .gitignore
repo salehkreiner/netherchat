@@ -14,7 +14,7 @@
 *.out
 coverage.*
 
-# Local crypto material — identity keys must NEVER be committed
+# Local crypto material â€” identity keys must NEVER be committed
 *.key
 identity.json
 identity*.json
@@ -39,3 +39,12 @@ qa-read-report.md
 web-read-report.md
 
 landing-extraction-plan.md
+
+# Release build output. The release workflow downloads signed binaries into
+# signed/ and writes the Windows zips into pkg/, both in the checkout root and
+# both before GoReleaser runs -- and GoReleaser refuses to build from a dirty
+# tree, because artifacts from an unrecognised working directory may not
+# correspond to the tag. Ignored rather than moved: they are build output, and
+# they should never be committed regardless.
+pkg/
+signed/
