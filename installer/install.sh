@@ -12,12 +12,20 @@
 # already ships in the same release archive. POSIX sh — no bashisms — so it runs
 # under sh, bash, ash (Alpine) and zsh alike.
 #
+# Every download is checked against the release's published SHA-256 before
+# anything is written to your PATH, and a download that cannot be checked is NOT
+# installed. See --allow-unverified below, and docs/verifying-downloads.md for
+# what a checksum does and does not prove.
+#
 # Options:
-#   --version <v>     install a specific version (default: latest release)
-#   --bin-dir <dir>   install into <dir> (default: ~/.local/bin)
-#   --with-server     also install the netherchat-server relay binary
-#   --uninstall       remove the installed client (and relay, if present)
-#   -h, --help        show this help
+#   --version <v>       install a specific version (default: latest release)
+#   --bin-dir <dir>     install into <dir> (default: ~/.local/bin)
+#   --with-server       also install the netherchat-server relay binary
+#   --allow-unverified  install even if the checksum cannot be OBTAINED. Never
+#                       skips a checksum that is present and wrong. Type it to
+#                       mean it — there is no environment variable for this.
+#   --uninstall         remove the installed client (and relay, if present)
+#   -h, --help          show this help
 #
 # Honored env vars: NETHERCHAT_VERSION, NETHERCHAT_BIN_DIR, NO_COLOR.
 
@@ -30,6 +38,10 @@ VERSION="${NETHERCHAT_VERSION:-latest}"
 BIN_DIR="${NETHERCHAT_BIN_DIR:-}"
 DO_UNINSTALL=0
 DO_SERVER=0
+# Deliberately NOT read from the environment. This is the one decision in the
+# script that trades away a security property, so it has to be typed on the
+# command line where the person running it can see it.
+ALLOW_UNVERIFIED=0
 
 # ---- pretty output ----------------------------------------------------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -44,8 +56,11 @@ ok()   { printf '  %s✓%s %s\n' "$C_GRN" "$C_RST" "$1"; }
 warn() { printf '  %s!%s %s\n' "$C_YEL" "$C_RST" "$1" >&2; }
 die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RST" "$1" >&2; exit 1; }
 
+# Prints the header comment block. Reads it structurally rather than by line
+# number: the previous `sed -n '2,19p'` silently truncated its own help text the
+# moment a line was added above the Options list.
 usage() {
-  sed -n '2,19p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+  awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" 2>/dev/null || true
 }
 
 # ---- args -------------------------------------------------------------------
@@ -56,6 +71,7 @@ while [ $# -gt 0 ]; do
     --bin-dir)   [ $# -ge 2 ] || die "--bin-dir needs a value"; BIN_DIR="$2"; shift 2 ;;
     --bin-dir=*) BIN_DIR="${1#*=}"; shift ;;
     --with-server) DO_SERVER=1; shift ;;
+    --allow-unverified) ALLOW_UNVERIFIED=1; shift ;;
     --uninstall) DO_UNINSTALL=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     *)           die "unknown option: $1 (try --help)" ;;
@@ -143,21 +159,46 @@ step "Downloading $archive"
 download "$base/$archive" "$tmp/$archive" || die "download failed: $base/$archive"
 ok "downloaded"
 
+# ---- verify -----------------------------------------------------------------
+# FAIL CLOSED. Three of the four outcomes below used to warn and carry on, which
+# meant an installer for a security product would put an unverified executable on
+# a user's PATH whenever the release page was slow, partial, or hostile — and say
+# so in yellow, once, in a stream of green ticks nobody reads.
+#
+# The distinction that matters: a checksum that is PRESENT AND WRONG is evidence
+# of a problem and is always fatal, --allow-unverified or not. A checksum that
+# cannot be obtained is an absence of evidence, and that is the only thing
+# --allow-unverified lets you accept.
 step "Verifying checksum"
+verified=0
+reason=""
 if download "$base/checksums.txt" "$tmp/checksums.txt" 2>/dev/null; then
   actual=$(sha256_of "$tmp/$archive" || true)
   expected=$(grep " ${archive}\$" "$tmp/checksums.txt" | awk '{print $1}' | head -1 || true)
   if [ -z "$actual" ]; then
-    warn "no sha256 tool found — skipping verification"
+    reason="this system has neither sha256sum nor shasum"
   elif [ -z "$expected" ]; then
-    warn "no checksum entry for $archive — skipping verification"
+    reason="release $tag publishes no checksum for $archive"
   elif [ "$actual" != "$expected" ]; then
-    die "checksum mismatch for $archive (expected $expected, got $actual)"
+    die "checksum mismatch for $archive (expected $expected, got $actual) — NOT installing"
   else
-    ok "sha256 verified"
+    verified=1
   fi
 else
-  warn "checksums.txt unavailable — skipping verification"
+  reason="could not fetch $base/checksums.txt"
+fi
+
+if [ "$verified" -eq 1 ]; then
+  ok "sha256 verified"
+elif [ "$ALLOW_UNVERIFIED" -eq 1 ]; then
+  warn "INSTALLING AN UNVERIFIED DOWNLOAD — $reason"
+  warn "--allow-unverified was given, so this is proceeding without checking the bytes."
+else
+  die "cannot verify $archive: $reason.
+       Refusing to install an executable whose integrity was not checked.
+       Re-run with --allow-unverified to accept that deliberately, or fetch the
+       release by hand from https://github.com/$REPO/releases/tag/$tag and check
+       it yourself. See docs/verifying-downloads.md."
 fi
 
 # ---- extract + install ------------------------------------------------------

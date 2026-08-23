@@ -1,0 +1,66 @@
+name: Signing hygiene
+
+# The release workflow only runs on a tag. That means a change which opened the
+# signing credential up — a workflow_dispatch trigger added "just to test it", an
+# environment: line deleted in a refactor, a secret reference copied into ci.yml —
+# would sit on main, green, until the next release tried to use it.
+#
+# So the invariants are checked here instead, on every push and every pull
+# request, by a job that holds no credential of its own and needs none: it reads
+# the workflow files.
+#
+# This job is deliberately NOT in ci.yml. ci.yml is the one workflow that must be
+# provably unable to reach a signing credential, and the cheapest way to keep that
+# provable is to leave it alone.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: signing credential invariants
+        run: bash .github/scripts/check-signing-hygiene.sh
+
+      # ci.yml already shellchecks installer/install.sh. These three are the
+      # release-side scripts, and the signing one runs with a private key in
+      # scope, so an unquoted expansion in it is not a style note.
+      - name: shellcheck the release scripts
+        run: |
+          shellcheck -s bash -S warning \
+            .github/scripts/sign-windows.sh \
+            .github/scripts/verify-signatures.sh \
+            .github/scripts/check-signing-hygiene.sh \
+            .github/scripts/check-installer-failclosed.sh
+
+      # The installers are what a user actually runs, and both of them decide
+      # whether to trust a download. install.sh is linted by ci.yml; this checks
+      # the property that lint cannot see — that neither installer treats a
+      # missing or unreadable checksum as a reason to continue.
+      - name: installers fail closed on an unverifiable download
+        run: bash .github/scripts/check-installer-failclosed.sh
+
+  # install.ps1 is the installer for the platform this whole effort exists for,
+  # and it is the only one that can check an Authenticode signature. Running it
+  # anywhere but Windows would test nothing.
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: install.ps1 fails closed, and refuses a foreign signer
+        shell: powershell
+        run: .\.github\scripts\check-installer-failclosed.ps1

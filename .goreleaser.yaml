@@ -1,6 +1,18 @@
 # GoReleaser — builds the release matrix, archives, checksums, Docker images and
 # Homebrew cask (R7). Validate with `goreleaser check`; dry-run with
 # `goreleaser release --snapshot --clean`.
+#
+# WINDOWS IS DELIBERATELY ABSENT FROM THIS FILE.
+#
+# GoReleaser builds its own binaries. If `windows` were still in the goos lists
+# below, a tagged release would publish an unsigned netherchat.exe alongside the
+# signed one that .github/workflows/release.yml produces — and the installers
+# fetch by filename, so the unsigned copy would be the one users got. The Windows
+# half of the matrix is built, signed, timestamped, verified and uploaded by that
+# workflow, and its Windows zips are added to the checksums.txt written here.
+#
+# Anything added to this file that emits a Windows artifact has to be signed too.
+# See docs/release-signing.md.
 version: 2
 project_name: netherchat
 
@@ -16,7 +28,7 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w -X github.com/salehkreiner/netherchat/buildinfo.Version={{ .Version }}
-    goos: [linux, darwin, windows]
+    goos: [linux, darwin]
     goarch: [amd64, arm64]
 
   - id: netherchat-server
@@ -26,17 +38,33 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w -X github.com/salehkreiner/netherchat/buildinfo.Version={{ .Version }}
-    goos: [linux, darwin, windows]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+  # The issuer-side CA tool. docs/self-hosting.md tells an operator to run
+  # `netherchat-identity keygen` and has never said where to get it — it shipped
+  # in no release, for any platform, so the only answer was `go build`. It is a
+  # customer artifact by every test that matters: a person runs it by hand, on a
+  # workstation, and it is the tool that mints the trust anchor everything else
+  # verifies against.
+  - id: netherchat-identity
+    main: ./cmd/netherchat-identity
+    binary: netherchat-identity
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/salehkreiner/netherchat/buildinfo.Version={{ .Version }}
+    goos: [linux, darwin]
     goarch: [amd64, arm64]
 
 archives:
   - id: default
-    ids: [netherchat, netherchat-server]
+    ids: [netherchat, netherchat-server, netherchat-identity]
     name_template: "netherchat_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
-    format_overrides:
-      - goos: windows
-        formats: [zip]
+    # No windows format_override: nothing here builds for windows any more. The
+    # workflow writes netherchat_windows_<arch>.zip with the same name and the
+    # same contents, from signed binaries.
     files:
       - README.md
       - PROTOCOL.md
@@ -107,3 +135,44 @@ release:
     owner: astralis-software-systems
     name: netherchat
   prerelease: auto
+  # The release page is where someone decides whether to trust a download, so it
+  # is where the difference between the two checks belongs. docs/encryption.md is
+  # precise about what a signature proves elsewhere in this project; a download
+  # page that says "verified" without saying verified-as-what is not.
+  footer: |
+
+    ## Verifying what you downloaded
+
+    Two different checks, and they answer two different questions.
+
+    **`checksums.txt` — did the bytes arrive intact?**
+
+    ```sh
+    sha256sum -c --ignore-missing checksums.txt      # Linux
+    shasum -a 256 -c --ignore-missing checksums.txt  # macOS
+    ```
+    ```powershell
+    (Get-FileHash netherchat_windows_amd64.zip -Algorithm SHA256).Hash
+    ```
+
+    A checksum published beside a download proves **integrity of transfer** and
+    **not origin**. It detects a truncated download or a corrupted mirror. It
+    does not tell you who built the file: anyone who can replace the archive on
+    this page can replace the line in `checksums.txt` that describes it.
+
+    **The Authenticode signature — who built it?**
+
+    ```powershell
+    Get-AuthenticodeSignature .\netherchat.exe | Format-List Status, SignerCertificate, TimeStamperCertificate
+    ```
+
+    `Status : Valid` with a signer of `O=Astralis Software Systems` is the check
+    that proves origin, because the private key is not on this page. Windows
+    itself performs it on every launch under Smart App Control, WDAC and
+    AppLocker.
+
+    `signing-report.txt` on this release records how these binaries were signed.
+    Linux and macOS binaries are not code-signed; there, the checksum is all
+    there is, and it is worth knowing that is a weaker claim.
+
+    Full detail: [docs/verifying-downloads.md](https://github.com/astralis-software-systems/netherchat/blob/main/docs/verifying-downloads.md)

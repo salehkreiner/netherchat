@@ -139,12 +139,35 @@ pull request:
 
 - **build-test** — `gofmt` check, `go vet ./...`, `go build ./...`,
   `go test -race ./...`, and the blind-relay boundary guard.
+- **web** / **interop-live** — the browser client, and the Go ↔ browser interop.
 - **shellcheck** — lints `installer/install.sh`.
 - **docker** — builds the `salkreiner/netherchat` image and runs a `/health`
   smoke test.
 
-`.github/workflows/release.yml` builds the cross-platform binary matrix and the
-Docker image on a release tag. All CI jobs must be green before a change merges.
+**`ci.yml` holds no signing credential and must never hold one.** It runs on every
+push and every pull request, including from forks. That property is asserted
+mechanically, not by convention — see below.
+
+`.github/workflows/signing-hygiene.yml` also runs on push and pull request:
+
+- **hygiene** — `.github/scripts/check-signing-hygiene.sh` asserts the release
+  workflow is tag-triggered only, that the signing job is gated by a GitHub
+  Environment and holds no write permission, that every signing-secret reference
+  lives inside that job, and that `ci.yml` references none of it. Plus shellcheck
+  on the release scripts, and `check-installer-failclosed.sh`, which runs
+  `install.sh` end to end and proves it refuses a download it could not verify.
+- **installer-windows** — the same for `install.ps1`, on `windows-latest`, where
+  it can also check an Authenticode signature.
+
+`.github/workflows/release.yml` runs on a `v*` tag: it cross-compiles the Windows
+artifacts, signs and timestamps them in a separate credential-bearing job, and
+publishes from a third job that holds no signing credential. Linux, macOS, the
+Docker images and the Homebrew cask come from GoReleaser; **Windows is
+deliberately absent from `.goreleaser.yaml`**, because GoReleaser builds its own
+binaries and would publish an unsigned copy under the same filename. See
+[docs/release-signing.md](docs/release-signing.md).
+
+All CI jobs must be green before a change merges.
 
 ---
 

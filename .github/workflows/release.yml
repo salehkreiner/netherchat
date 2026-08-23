@@ -1,23 +1,227 @@
 name: Release
 
-# Tag a release to publish binaries, the Docker image, and the Homebrew formula:
+# Tag a release to publish binaries, the Docker image, and the Homebrew cask:
 #   git tag v0.2.0 && git push origin v0.2.0
+#
+# THREE JOBS, AND THE SPLIT IS THE SECURITY PROPERTY.
+#
+#   build-windows   cross-compiles the Windows artifacts.  No credentials.
+#   sign-windows    signs and timestamps them.             Signing credential;
+#                   `permissions: contents: read`, so it CANNOT publish anything.
+#   release         publishes the GitHub Release.          `contents: write`, and
+#                   no signing credential, so it CANNOT sign anything.
+#
+# The job that can sign cannot publish, and the job that can publish cannot sign.
+# A compromise of either one alone does not produce a signed artifact on a
+# netherchat release page. That is the whole reason this is not one job.
+#
+# THE CREDENTIAL SEAM is one step — "sign Windows artifacts" in sign-windows —
+# calling .github/scripts/sign-windows.sh. Until the SSL.com certificate exists
+# it signs with a throwaway certificate generated inside the job. Swapping in the
+# real credential is a repository variable and four environment secrets; no YAML
+# changes. docs/release-signing.md is the checklist.
 #
 # Required repository secrets:
 #   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  — to push salkreiner/netherchat
 #   HOMEBREW_TAP_TOKEN                    — PAT with write access to the tap repo
+# Required `release-signing` ENVIRONMENT secrets (only once SIGNING_MODE=esigner):
+#   ESIGNER_USERNAME / ESIGNER_PASSWORD / ESIGNER_CREDENTIAL_ID / ESIGNER_TOTP_SECRET
 # (GITHUB_TOKEN for the release itself is provided automatically.)
 
+# The ONLY trigger. No pull_request, no workflow_dispatch, no workflow_call, no
+# schedule — a signing credential that a pull request can reach is a signing
+# credential anyone with a fork can reach. .github/workflows/signing-hygiene.yml
+# fails the build if a second trigger is ever added here.
 on:
   push:
     tags: ["v*"]
 
+# Least privilege by default; each job widens only what it needs.
 permissions:
-  contents: write
+  contents: read
+
+env:
+  GO_VERSION: "1.26.6"
+  # THE ARTIFACT DECISION. Sixteen binaries live under cmd/; these three are the
+  # ones a customer runs on Windows. The other thirteen are server-side adapters
+  # that docs/connectors.md and docs/nc5-connectors.md already say are built from
+  # source, and they are deployed next to a relay, not downloaded by a person.
+  # Each name here costs two signatures per release (amd64 + arm64) against a
+  # metered quota, so this list is a budget, not a formality.
+  WINDOWS_BINARIES: "netherchat netherchat-server netherchat-identity"
+  WINDOWS_ARCHES: "amd64 arm64"
+  # 3 binaries x 2 arches. Asserted, so that dropping a target silently cannot
+  # turn the signature check green by giving it less to check.
+  WINDOWS_ARTIFACT_COUNT: "6"
 
 jobs:
-  goreleaser:
+  # ---------------------------------------------------------------------------
+  # 1. Build. Holds nothing. Produces unsigned PE images.
+  # ---------------------------------------------------------------------------
+  build-windows:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Same flags as .goreleaser.yaml uses for the linux/darwin half, so the
+      # Windows binaries differ from their siblings only in GOOS.
+      - name: cross-compile Windows artifacts
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          for arch in $WINDOWS_ARCHES; do
+            mkdir -p "dist-windows/windows_${arch}"
+            for bin in $WINDOWS_BINARIES; do
+              echo "building ${bin}.exe for windows/${arch}"
+              GOOS=windows GOARCH="$arch" CGO_ENABLED=0 go build -trimpath \
+                -ldflags "-s -w -X github.com/salehkreiner/netherchat/buildinfo.Version=${version}" \
+                -o "dist-windows/windows_${arch}/${bin}.exe" "./cmd/${bin}"
+            done
+          done
+          find dist-windows -type f -name '*.exe' | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-unsigned
+          path: dist-windows/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2. Sign. The only job in this repository that can reach a signing credential.
+  # ---------------------------------------------------------------------------
+  sign-windows:
+    needs: build-windows
+    runs-on: ubuntu-latest
+
+    # THE GATE. GitHub injects an environment's secrets only into a job that
+    # names that environment AND whose ref satisfies the environment's deployment
+    # rule. `release-signing` must be configured with:
+    #   - Deployment branches and tags: "Selected" -> tag rule `v*`  (server-side
+    #     enforcement: a job on a branch cannot obtain these secrets even if this
+    #     file is edited to try)
+    #   - Required reviewers: at least one maintainer  (a human approves every
+    #     use of the signing key, and every approval is in the deployment log)
+    #   - The ESIGNER_* values stored as ENVIRONMENT secrets, never repository
+    #     secrets, so nothing that omits `environment:` can see them.
+    environment: release-signing
+
+    # Deliberately read-only. This job holds the key and cannot create a release,
+    # upload an asset, move a tag, or write to the repository.
+    permissions:
+      contents: read
+
+    steps:
+      # Defence in depth behind the trigger. If someone later adds
+      # workflow_dispatch to the `on:` block above, this fails before the seam.
+      # The ref is passed through env rather than interpolated into the script:
+      # a tag name is attacker-controllable text.
+      - name: refuse any trigger that is not a pushed v* tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF: ${{ github.ref }}
+        run: |
+          fail() { echo "::error::signing refused: $1"; exit 1; }
+          [ "$EVENT" = "push" ]     || fail "event is '$EVENT', expected 'push'"
+          [ "$REF_TYPE" = "tag" ]   || fail "ref_type is '$REF_TYPE', expected 'tag'"
+          case "$REF" in
+            refs/tags/v*) ;;
+            *) fail "ref is '$REF', expected refs/tags/v*" ;;
+          esac
+          echo "signing gate: push of $REF — allowed"
+
+      - uses: actions/checkout@v4
+
+      - name: install osslsigncode
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends osslsigncode
+          osslsigncode --version
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-unsigned
+          path: dist-windows
+
+      # =======================================================================
+      # THE CREDENTIAL SEAM — one step, one script, two modes.
+      #
+      #   today:  SIGNING_MODE unset  -> a certificate generated in this job
+      #   swap:   SIGNING_MODE=esigner + the four ESIGNER_* environment secrets
+      #
+      # Nothing above or below this step changes when the real certificate
+      # arrives. See docs/release-signing.md.
+      # =======================================================================
+      - name: sign Windows artifacts
+        env:
+          SIGNING_MODE: ${{ vars.SIGNING_MODE || 'selfsigned' }}
+          SIGN_CA_OUT: signing-ca.crt
+          SIGN_REPORT: signing-report.txt
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+        run: |
+          # shellcheck disable=SC2046
+          bash .github/scripts/sign-windows.sh $(find dist-windows -type f -name '*.exe' | sort)
+
+      # Reads osslsigncode's OUTPUT, not its exit code: `osslsigncode verify`
+      # exits 0 on a signature with no timestamp. Points at the directory, not a
+      # file list, so an artifact that never reached the signer cannot pass by
+      # being left out of the arguments.
+      - name: verify every artifact is signed and timestamped
+        env:
+          SIGNING_MODE: ${{ vars.SIGNING_MODE || 'selfsigned' }}
+        run: |
+          if [ "$SIGNING_MODE" = "esigner" ]; then
+            ca="system"; subject="Astralis Software Systems"
+          else
+            ca="signing-ca.crt"; subject="Astralis Software Systems"
+          fi
+          bash .github/scripts/verify-signatures.sh \
+            --ca "$ca" \
+            --expect-count "$WINDOWS_ARTIFACT_COUNT" \
+            --expect-subject "$subject" \
+            dist-windows
+
+      - name: signing report
+        run: |
+          echo "### Windows signing" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat signing-report.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-signed
+          # signing-ca.crt is the throwaway anchor for the re-check in the
+          # release job. It is a build artifact and is never published: it is a
+          # root certificate, and a root certificate on a download page is an
+          # invitation to trust it.
+          path: |
+            dist-windows/
+            signing-ca.crt
+            signing-report.txt
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. Release. Can publish; holds no signing credential.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: sign-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,7 +229,66 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-signed
+          path: signed
+
+      - name: install osslsigncode
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends osslsigncode
+
+      # The publishing job does not take the signing job's word for it. In
+      # esigner mode this is a genuinely independent check: the anchor is the
+      # system trust store and the subject is the real Astralis certificate. In
+      # selfsigned mode the anchor comes from the signing job, so it re-checks
+      # integrity but not provenance — stated rather than papered over.
+      - name: re-verify signatures before publishing
+        env:
+          SIGNING_MODE: ${{ vars.SIGNING_MODE || 'selfsigned' }}
+        run: |
+          if [ "$SIGNING_MODE" = "esigner" ]; then ca="system"; else ca="signed/signing-ca.crt"; fi
+          bash .github/scripts/verify-signatures.sh \
+            --ca "$ca" \
+            --expect-count "$WINDOWS_ARTIFACT_COUNT" \
+            --expect-subject "Astralis Software Systems" \
+            signed/dist-windows
+
+      # A self-signed binary is not a release. Windows rejects it, and a release
+      # page that offers one is worse than one that offers nothing. Until
+      # SIGNING_MODE=esigner, a tag with no prerelease suffix stops here.
+      - name: refuse to publish development-signed binaries as a full release
+        env:
+          SIGNING_MODE: ${{ vars.SIGNING_MODE || 'selfsigned' }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$SIGNING_MODE" = "esigner" ]; then
+            echo "signing mode: esigner — full releases allowed"; exit 0
+          fi
+          case "$TAG" in
+            *-*) echo "signing mode: selfsigned, tag $TAG is a prerelease — allowed" ;;
+            *)   echo "::error::$TAG is not a prerelease, and SIGNING_MODE is 'selfsigned'."
+                 echo "::error::These binaries carry a throwaway certificate Windows will reject."
+                 echo "::error::Either tag a prerelease (v0.3.0-rc1), or complete the swap in docs/release-signing.md."
+                 exit 1 ;;
+          esac
+
+      - name: package signed Windows archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          for arch in $WINDOWS_ARCHES; do
+            stage="pkg/windows_${arch}"
+            mkdir -p "$stage"
+            cp "signed/dist-windows/windows_${arch}"/*.exe "$stage/"
+            cp README.md PROTOCOL.md LICENSE "$stage/"
+            (cd "$stage" && zip -q -X -r "../../dist/netherchat_windows_${arch}.zip" .)
+          done
+          ls -l dist/
 
       - name: Set up QEMU (multi-arch images)
         uses: docker/setup-qemu-action@v3
@@ -39,7 +302,11 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Run GoReleaser
+      # GoReleaser owns linux + darwin, the Docker images, and the Homebrew cask.
+      # Windows is deliberately absent from .goreleaser.yaml: goreleaser builds
+      # its own binaries, so leaving Windows in it would publish an unsigned copy
+      # of every artifact this pipeline just signed.
+      - name: Run GoReleaser (linux + darwin)
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
@@ -48,3 +315,45 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      # One checksums.txt for the whole release, because that is the file both
+      # installers fetch and grep. Computed on the SIGNED bytes: signing rewrites
+      # the PE and its checksum, so a hash taken before signing would be wrong
+      # for every Windows artifact.
+      - name: add Windows artifacts to checksums.txt
+        run: |
+          cd dist
+          sha256sum netherchat_windows_*.zip >> checksums.txt
+          echo "--- checksums.txt ---"
+          cat checksums.txt
+
+      - name: attach signed Windows artifacts to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" \
+            dist/netherchat_windows_amd64.zip \
+            dist/netherchat_windows_arm64.zip \
+            dist/checksums.txt \
+            signed/signing-report.txt \
+            --clobber
+
+      # Reading is not running. Ask the release API what is actually attached,
+      # rather than inferring it from the upload step exiting 0.
+      - name: confirm the release carries what it should
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          echo "$assets"
+          for want in netherchat_windows_amd64.zip netherchat_windows_arm64.zip checksums.txt signing-report.txt; do
+            printf '%s\n' "$assets" | grep -qx "$want" || {
+              echo "::error::release $TAG is missing $want"; exit 1; }
+          done
+          for want in netherchat_windows_amd64.zip netherchat_windows_arm64.zip; do
+            grep -q " $want\$" dist/checksums.txt || {
+              echo "::error::checksums.txt has no entry for $want"; exit 1; }
+          done
+          echo "release $TAG: all expected assets present and checksummed"
