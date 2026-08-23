@@ -153,7 +153,10 @@ mechanically, not by convention — see below.
 - **hygiene** — `.github/scripts/check-signing-hygiene.sh` asserts the release
   workflow is tag-triggered only, that the signing job is gated by a GitHub
   Environment and holds no write permission, that every signing-secret reference
-  lives inside that job, and that `ci.yml` references none of it. Plus shellcheck
+  lives inside that job, and that `ci.yml` references none of it. Then
+  `check-signing-environment.sh` asks the API whether that Environment is
+  actually a gate — it was auto-created with `"protection_rules": []`, so the
+  first check passed on a `environment:` line that gated nothing. Plus shellcheck
   on the release scripts, and `check-installer-failclosed.sh`, which runs
   `install.sh` end to end and proves it refuses a download it could not verify.
 - **installer-windows** — the same for `install.ps1`, on `windows-latest`, where

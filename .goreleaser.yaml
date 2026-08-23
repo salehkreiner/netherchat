@@ -78,12 +78,22 @@ snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
 
 changelog:
-  sort: asc
+  # NO `sort:`. GoReleaser's `sort: asc` orders entries ALPHABETICALLY by subject,
+  # not chronologically. It is why the v0.0.1-signing-test2 notes opened "Add …",
+  # "Cite …", "Merge chore/…", "Merge ci/…" — an index, not a release note.
+  # Omitting the key leaves git's own order, which is the one worth reading.
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+      # THE SCOPE IS NOT OPTIONAL TO MATCH — it is optional to WRITE, and both
+      # forms are in use here. `^docs:` does not match `docs(landing):`, so seven
+      # commits reached the v0.0.1-signing-test2 notes past filters written to
+      # exclude exactly them. `ci` joins the list for the same reason the other
+      # three are on it: it changes nothing a person downloading a release runs.
+      - '^(docs|test|chore|ci)(\([^)]*\))?:'
+      # A merge commit's subject is a branch name; the commits it brought in are
+      # listed on their own line already. Twenty of those fifty-four entries were
+      # "Merge fix/…", describing work the entry below them also described.
+      - '^Merge '
 
 dockers:
   - id: netherchat-amd64

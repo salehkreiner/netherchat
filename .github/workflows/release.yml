@@ -276,19 +276,37 @@ jobs:
                  exit 1 ;;
           esac
 
-      - name: package signed Windows archives
-        env:
-          TAG: ${{ github.ref_name }}
+      # DIRECTORY OWNERSHIP. This is run 2's bug, and it is not a glob typo.
+      #
+      #   dist/  is GORELEASER'S. It is started with --clean, whose first act is
+      #          "cleaning distribution directory" — it DELETES dist/ wholesale.
+      #          Nothing else may stage anything there, at any point.
+      #   pkg/   is THIS WORKFLOW'S. GoReleaser neither reads nor writes it, so
+      #          what lands here survives whatever runs afterwards.
+      #
+      # Run 2 wrote the zips into dist/ and then ran GoReleaser four steps later.
+      # Both archives — signed, timestamped, verified, 29MB — were deleted before
+      # anything looked for them, and the first step to notice was the one that
+      # went looking. The two directories were sharing a meaning ("build output")
+      # while one of them belonged to a tool that empties it on startup.
+      #
+      # The single deliberate crossing is checksums.txt, below: one file for the
+      # whole release, appended to only AFTER GoReleaser has written it.
+      - name: package signed Windows archives into pkg/
         run: |
-          mkdir -p dist
+          out="$PWD/pkg"
+          mkdir -p "$out"
           for arch in $WINDOWS_ARCHES; do
-            stage="pkg/windows_${arch}"
+            stage="pkg/stage/windows_${arch}"
             mkdir -p "$stage"
             cp "signed/dist-windows/windows_${arch}"/*.exe "$stage/"
             cp README.md PROTOCOL.md LICENSE "$stage/"
-            (cd "$stage" && zip -q -X -r "../../dist/netherchat_windows_${arch}.zip" .)
+            # Same layout and contents as the tar.gz siblings GoReleaser builds.
+            (cd "$stage" && zip -q -X -r "$out/netherchat_windows_${arch}.zip" .)
+            test -s "$out/netherchat_windows_${arch}.zip" || {
+              echo "::error::pkg/netherchat_windows_${arch}.zip was not created"; exit 1; }
           done
-          ls -l dist/
+          ls -l "$out"
 
       - name: Set up QEMU (multi-arch images)
         uses: docker/setup-qemu-action@v3
@@ -301,6 +319,19 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The ownership rule above, made mechanical. Anything staged in dist/ by
+      # now is about to be deleted without a word — which is precisely how run 2
+      # lost both archives. This says so instead.
+      - name: dist/ is GoReleaser's alone
+        run: |
+          if [ -e dist ]; then
+            echo "::error::dist/ exists before GoReleaser runs, and 'release --clean' deletes it."
+            echo "::error::Output that has to survive GoReleaser belongs in pkg/."
+            ls -la dist
+            exit 1
+          fi
+          echo "dist/ absent — GoReleaser will create and own it"
 
       # GoReleaser owns linux + darwin, the Docker images, and the Homebrew cask.
       # Windows is deliberately absent from .goreleaser.yaml: goreleaser builds
@@ -320,12 +351,29 @@ jobs:
       # installers fetch and grep. Computed on the SIGNED bytes: signing rewrites
       # the PE and its checksum, so a hash taken before signing would be wrong
       # for every Windows artifact.
+      #
+      # THE ONE PLACE THE TWO DIRECTORIES MEET, and so the only step here whose
+      # position in this file is load-bearing: it appends to a file GoReleaser
+      # wrote, so it has to run after GoReleaser. The first check makes moving it
+      # earlier fail here and say why, rather than append to a file that
+      # GoReleaser then deletes.
       - name: add Windows artifacts to checksums.txt
         run: |
-          cd dist
-          sha256sum netherchat_windows_*.zip >> checksums.txt
+          test -s dist/checksums.txt || {
+            echo "::error::dist/checksums.txt is missing or empty. GoReleaser writes it, so"
+            echo "::error::this step must run after 'Run GoReleaser (linux + darwin)'."
+            exit 1; }
+          for arch in $WINDOWS_ARCHES; do
+            test -s "pkg/netherchat_windows_${arch}.zip" || {
+              echo "::error::pkg/netherchat_windows_${arch}.zip is missing. It is written by"
+              echo "::error::'package signed Windows archives into pkg/'."
+              exit 1; }
+          done
+          # cd into pkg/ so the appended lines carry bare filenames, matching both
+          # GoReleaser's own entries and the names the installers grep for.
+          (cd pkg && sha256sum netherchat_windows_*.zip) >> dist/checksums.txt
           echo "--- checksums.txt ---"
-          cat checksums.txt
+          cat dist/checksums.txt
 
       - name: attach signed Windows artifacts to the release
         env:
@@ -333,27 +381,69 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           gh release upload "$TAG" \
-            dist/netherchat_windows_amd64.zip \
-            dist/netherchat_windows_arm64.zip \
+            pkg/netherchat_windows_amd64.zip \
+            pkg/netherchat_windows_arm64.zip \
             dist/checksums.txt \
             signed/signing-report.txt \
             --clobber
 
       # Reading is not running. Ask the release API what is actually attached,
       # rather than inferring it from the upload step exiting 0.
+      #
+      # This step has still never executed: run 2 died two steps before it. It
+      # WOULD have caught run 2 — that release carried checksums.txt and four
+      # tar.gz and nothing else, and the first loop below names each Windows zip.
+      # Two things it would NOT have caught are closed here:
+      #
+      #   - it re-read the LOCAL dist/checksums.txt, the file it had just written
+      #     itself. That confirms intent, not outcome, for the one file every
+      #     installer fetches. It now reads the published copy.
+      #   - it checked only that a LINE naming each zip existed, never that the
+      #     hash on it was right. A checksum taken before signing — the exact
+      #     mistake the step above exists to prevent — would have passed. It now
+      #     runs sha256sum -c against the archives the release is serving.
       - name: confirm the release carries what it should
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -o pipefail
+
+          # Named rather than counted, and GoReleaser's half is named too: a
+          # matrix that quietly loses a target must not be able to turn this
+          # green by giving it less to check. Same reasoning as
+          # WINDOWS_ARTIFACT_COUNT at the top of this file.
+          want="checksums.txt signing-report.txt"
+          for arch in $WINDOWS_ARCHES; do
+            want="$want netherchat_windows_${arch}.zip"
+          done
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              want="$want netherchat_${os}_${arch}.tar.gz"
+            done
+          done
+
           assets=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
           echo "$assets"
-          for want in netherchat_windows_amd64.zip netherchat_windows_arm64.zip checksums.txt signing-report.txt; do
-            printf '%s\n' "$assets" | grep -qx "$want" || {
-              echo "::error::release $TAG is missing $want"; exit 1; }
+          for a in $want; do
+            printf '%s\n' "$assets" | grep -qxF "$a" || {
+              echo "::error::release $TAG is missing $a"; exit 1; }
           done
-          for want in netherchat_windows_amd64.zip netherchat_windows_arm64.zip; do
-            grep -q " $want\$" dist/checksums.txt || {
-              echo "::error::checksums.txt has no entry for $want"; exit 1; }
+
+          # The published bytes, not the local ones: download what a user would
+          # download, and check it against the checksums.txt the same page serves.
+          v=$(mktemp -d)
+          gh release download "$TAG" --dir "$v" --pattern checksums.txt
+          for arch in $WINDOWS_ARCHES; do
+            gh release download "$TAG" --dir "$v" --pattern "netherchat_windows_${arch}.zip"
+            grep -q " netherchat_windows_${arch}\.zip\$" "$v/checksums.txt" || {
+              echo "::error::published checksums.txt has no entry for netherchat_windows_${arch}.zip"
+              exit 1; }
           done
-          echo "release $TAG: all expected assets present and checksummed"
+          # --ignore-missing skips the linux/darwin lines, whose archives are not
+          # downloaded here. It exits non-zero when it verified nothing at all, so
+          # it cannot pass by checking an empty set.
+          (cd "$v" && sha256sum -c --ignore-missing checksums.txt)
+
+          echo "release $TAG: every expected asset is present, and the published"
+          echo "Windows archives match the published checksums.txt"

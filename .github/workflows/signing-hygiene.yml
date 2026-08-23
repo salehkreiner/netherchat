@@ -7,7 +7,8 @@ name: Signing hygiene
 #
 # So the invariants are checked here instead, on every push and every pull
 # request, by a job that holds no credential of its own and needs none: it reads
-# the workflow files.
+# the workflow files — and, since the two runs that found the environment gate
+# empty, the environment settings those files depend on.
 #
 # This job is deliberately NOT in ci.yml. ci.yml is the one workflow that must be
 # provably unable to reach a signing credential, and the cheapest way to keep that
@@ -30,7 +31,23 @@ jobs:
       - name: signing credential invariants
         run: bash .github/scripts/check-signing-hygiene.sh
 
-      # ci.yml already shellchecks installer/install.sh. These three are the
+      # The check above reads release.yml and confirms the signing job names an
+      # environment. It cannot see what is on the other side of that name, and
+      # what was on the other side of it — for both real runs of the release
+      # workflow — was `"protection_rules": []`. GitHub auto-creates an
+      # environment on first use with no rules, so the gate existed as a word in
+      # a YAML file and as nothing else.
+      #
+      # Reading the settings page is what nobody does; this asks the API. The
+      # token is passed because it raises the rate limit, not because the data
+      # needs it: the repository is public, and the script falls back to an
+      # anonymous read if a scoped token is refused.
+      - name: the signing environment is actually a gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/check-signing-environment.sh
+
+      # ci.yml already shellchecks installer/install.sh. These are the
       # release-side scripts, and the signing one runs with a private key in
       # scope, so an unquoted expansion in it is not a style note.
       - name: shellcheck the release scripts
@@ -39,6 +56,7 @@ jobs:
             .github/scripts/sign-windows.sh \
             .github/scripts/verify-signatures.sh \
             .github/scripts/check-signing-hygiene.sh \
+            .github/scripts/check-signing-environment.sh \
             .github/scripts/check-installer-failclosed.sh
 
       # The installers are what a user actually runs, and both of them decide

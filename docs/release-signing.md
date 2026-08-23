@@ -104,6 +104,19 @@ Windows zips are built in the `release` job from the signed binaries and their
 hashes are appended to the same `checksums.txt` GoReleaser wrote, so there is one
 checksum file for the whole release — which is what both installers expect.
 
+**`dist/` is GoReleaser's and `pkg/` is the workflow's.** GoReleaser runs with
+`--clean`, whose first act is to delete `dist/` wholesale, so nothing else may
+stage anything there: the second real run wrote the Windows zips into `dist/`
+before GoReleaser ran, and both signed, timestamped, verified archives were
+deleted four steps before anything looked for them. The zips are written to
+`pkg/`, which GoReleaser neither reads nor writes.
+
+The one deliberate crossing is `checksums.txt`, because the whole release needs
+exactly one of them. That single append is therefore the only step in
+`release.yml` whose position in the file is load-bearing, and it refuses to run
+if `dist/checksums.txt` is not already there — moving it back above GoReleaser
+fails loudly instead of writing to a file GoReleaser then deletes.
+
 ---
 
 ## The four protections, and how each is enforced
@@ -162,6 +175,40 @@ Until the certificate exists, none of these secrets are set, and the pipeline
 signs with a throwaway certificate that needs no secret at all — so an
 unconfigured environment costs nothing today and is required before the swap.
 
+#### "A maintainer must configure this once" is not a guarantee, and it was not true
+
+The first two runs of the release workflow ran against an environment that
+looked exactly like the one above from inside `release.yml` and had nothing in
+it. GitHub **auto-creates** an environment the moment a job names one, with:
+
+```json
+"protection_rules": []
+```
+
+No reviewer, no tag rule. `sign-windows` declared `environment: release-signing`,
+the hygiene guard confirmed the line was there, this table said what the setting
+should be — and the gate was a word in a YAML file. It was found by asking the
+API, which is the only place the answer lives.
+
+`.github/scripts/check-signing-environment.sh` now asks on every push and every
+pull request. It reads the environment **name out of `release.yml`** rather than
+hardcoding it, so renaming the environment in one place and not the other is
+also caught, and it fails when:
+
+| It fails when | Because |
+|---|---|
+| `protection_rules` is empty | this is the state found; the gate exists in name only |
+| there are no required reviewers | the key is then used on whatever a tag push says, unreviewed |
+| there is no deployment policy, or it selects branches | a branch could reach the signing key |
+| a tag rule does not start with `v` | a rule wider than `release.yml`'s own `v*` trigger admits refs the workflow refuses |
+| administrators may bypass the rules | the reviewer requirement is then advisory for exactly the accounts most worth requiring it of |
+| the API cannot be read at all | a guard that goes green because it could not check is the defect this script is about |
+
+It notes, without failing, that `prevent_self_review` is off. With one
+maintainer it has to be: the person who pushes the tag approves the signing run.
+That is what this gate proves, and it is worth stating rather than reading the
+table above as though a second person were involved.
+
 ### 4. Nothing in `ci.yml` can touch it
 
 `ci.yml` is unchanged by this work and stays that way. It declares no
@@ -171,17 +218,26 @@ guard asserts all three on every push and every pull request.
 
 ### The guard
 
-`.github/scripts/check-signing-hygiene.sh`, run by
+`.github/scripts/check-signing-hygiene.sh` and
+`.github/scripts/check-signing-environment.sh`, both run by
 `.github/workflows/signing-hygiene.yml` on push and pull request.
+
+They are two scripts because they fail for two reasons. The first reads three
+files in the checkout and needs no network, no token and no repository — worth
+keeping true, because it is the one that can be run by hand on a plane. The
+second is about repository *settings*, which no file in the checkout records, so
+it has to ask the API and can fail for reasons a contributor cannot fix locally.
 
 The release workflow only runs on a tag, so a change that opened the credential
 up — a `workflow_dispatch` added "just to test it", an `environment:` line lost
 in a refactor, a secret copied into `ci.yml` — would sit on `main`, green, until
 someone tagged a release. The guard is what makes that a red build instead.
 
-It checks the four rules above, plus: the signing script is *run* from exactly
-one step in exactly one workflow; no step that runs the verifier carries `if:` or
-`continue-on-error:`; and the signing job requests no write permission.
+The first checks the four rules above, plus: the signing script is *run* from
+exactly one step in exactly one workflow; no step that runs the verifier carries
+`if:` or `continue-on-error:`; and the signing job requests no write permission.
+The second checks that the environment rule 3 names is configured as rule 3 says
+— the table is in section 3.
 
 It is deliberately **not** part of `ci.yml`. `ci.yml` is the one workflow that
 must be provably unable to reach a signing credential, and the cheapest way to
